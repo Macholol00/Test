@@ -896,7 +896,8 @@
             <div class="settings-grid">
                 <div class="setting-card">
                     <h3>Claude Cloud Credits</h3>
-                    <p style="color:var(--paper-faint);font-size:12px;margin-bottom:10px;">Runs each roleplay reply in a Claude Code <b>cloud session</b> (<code>claude -p --cloud</code>) so it uses your cloud-session credits instead of local Claude Code usage. Slower (a cloud container starts for every reply, often 30s&ndash;a few minutes), and CLI session reuse is skipped, so every turn sends the full prompt; auto-summary helps keep that small. Background helpers (summaries, lorebook, memory librarian, image descriptions) still run locally. Needs a recent Claude CLI with cloud access; test with <code>echo hi | claude -p --cloud</code>.</p>
+                    <p style="color:var(--paper-faint);font-size:12px;margin-bottom:10px;">Sends each roleplay reply to one of your Claude Code <b>cloud sessions</b> (<code>claude -p --cloud &lt;session&gt;</code>) so it uses your cloud-session credits instead of local Claude Code usage. Create a session at <a href="https://claude.ai/code" target="_blank" rel="noopener noreferrer" style="color:var(--accent);">claude.ai/code</a> (pick the model there; the Model and Effort settings here don't apply to it), then paste its URL or ID below. Replies are slower than local. Follow-up turns send only your newest message; swipes and edits resend the full context. Background helpers (summaries, lorebook, memory librarian, image descriptions) still run locally.</p>
+                    <input type="text" id="cloudSessionId" placeholder="https://claude.ai/code/session_… or session_…" spellcheck="false" autocomplete="off" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:10px 12px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;">
                     <div class="switch-container">
                         <label class="switch">
                             <input type="checkbox" id="useCloudCredits">
@@ -2767,6 +2768,7 @@ Common subject fields: subject, character, npc, entity, name.' style="width:100%
                 tool_calling_enabled: document.getElementById('toolCalling').checked,
                 cli_session_reuse: document.getElementById('cliSessionReuse').checked,
                 use_cloud_credits: document.getElementById('useCloudCredits').checked,
+                cloud_session_id: document.getElementById('cloudSessionId').value.trim(),
                 character_memory_v2_enabled: document.getElementById('characterMemoryV2').checked,
                 update_check_enabled: document.getElementById('updateCheck').checked,
                 bridge_port: parseInt(document.getElementById('bridgePort').value, 10) || 5001,
@@ -2880,6 +2882,7 @@ Common subject fields: subject, character, npc, entity, name.' style="width:100%
                 const useCloudCredits = settings.use_cloud_credits === true;
                 document.getElementById('useCloudCredits').checked = useCloudCredits;
                 document.getElementById('useCloudCreditsStatus').textContent = useCloudCredits ? 'On (cloud credits)' : 'Off (local)';
+                document.getElementById('cloudSessionId').value = settings.cloud_session_id || '';
 
                 // Character memory (default false — opt-in)
                 const characterMemoryV2Enabled = settings.character_memory_v2_enabled === true;

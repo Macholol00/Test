@@ -127,26 +127,31 @@ Edit any of these, save, and the next request picks up the change. No server res
 
 ## Claude cloud credits (optional)
 
-The **Claude Cloud Credits** switch at the top of the Settings tab sends each roleplay reply to a **Claude Code cloud session** (`claude -p --cloud`) instead of your local `claude -p`. That reply then uses your Claude Code cloud-session credits rather than your local Claude Code usage. Turn it off and the bridge works exactly as before. The choice is saved in `bridge_settings.json`.
+The **Claude Cloud Credits** switch at the top of the Settings tab sends each roleplay reply to one of your **Claude Code cloud sessions** (`claude -p --cloud <session>`) instead of your local `claude -p`. That reply then uses your Claude Code cloud-session credits rather than your local Claude Code usage. Turn it off and the bridge works exactly as before. The switch and the session are saved in `bridge_settings.json`.
 
-Before turning it on, check that cloud mode works from a terminal on the same machine:
+The Claude CLI can't start a new cloud session from a script, only send messages to one that already exists. So set it up once:
+
+1. Go to [claude.ai/code](https://claude.ai/code) and start a new session. Any repository works; the bridge tells it not to touch any code. Pick the model you want for the roleplay there. The bridge's Model and Effort settings don't apply to cloud sessions.
+2. Copy the session's URL from the browser (`https://claude.ai/code/session_…`).
+3. In the bridge's Settings tab, paste it into the box under **Claude Cloud Credits**, turn the switch on and click **Save Settings**.
+
+To check it from a terminal first:
 
 ```bash
-echo "Say hi in five words." | claude -p --cloud
+claude -p "Say hi in five words." --cloud <your session URL or ID>
 ```
-
-If that prints a reply, the switch will work. If it errors, update the CLI (`claude update`) and make sure you can start a cloud session at claude.ai/code.
 
 What changes while it's on:
 
-- **Slower replies.** Every reply starts a cloud container, so expect roughly 30 seconds to a few minutes.
-- **No CLI session reuse.** `--resume` isn't available for cloud turns, so each turn sends the full prompt. Turn on Auto-Summary to keep that prompt small. The local session for the character is cleared, so when you switch back to local the next turn starts fresh with the full history.
-- **The system prompt goes into the message.** The cloud container runs with its own configuration and ignores `--system-prompt-file`, so the bridge puts your system prompt at the top of the message instead. Model and effort are still passed along.
+- **Slower replies** than local ones.
+- **One session holds the whole roleplay.** Like CLI session reuse, follow-up turns send only your newest message, because the cloud session already has the earlier ones. The first turn, a swipe, an edit or a regenerate sends the full context instead, with a note telling Claude to ignore the older messages in the session. (With CLI Session Reuse turned off, every turn sends the full context.) Turn on Auto-Summary to keep the full-context turns small. You can watch the conversation at claude.ai/code.
+- **A swipe or Stop doesn't stop a turn already running in the cloud.** If the session is still busy when the next message arrives, the bridge waits and retries for up to 5 minutes.
+- **The system prompt goes into the message.** An existing session keeps its own configuration, so the bridge puts your system prompt at the top of each full-context message.
 - **Only the main reply runs in the cloud.** Auto-summary, the lorebook, the Character Memory librarian and image descriptions still run on your local CLI.
 - **Images the local pre-pass can't describe are skipped.** The cloud session can't open files on your PC. Images that the local description pass handles still work.
 - **`response_format` / JSON schema requests are ignored.**
-- **One session per reply.** Each reply shows up in your claude.ai/code session list as "SillyTavern bridge"; archive them there whenever you like.
-- **Your files stay local.** The CLI is started from an empty temporary folder (`claude_bridge_cloud` in your temp directory), so your chats, memory databases and settings aren't synced into the cloud session.
+- **Switching modes starts fresh.** Local and cloud turns don't see each other's turns, so after switching, the first turn sends the full history.
+- **Your files stay local.** The CLI is started from an empty temporary folder (`claude_bridge_cloud` in your temp directory), so none of your chats, memory databases or settings are synced into the cloud session.
 
 ## Known limitations
 

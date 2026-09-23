@@ -17,6 +17,7 @@ import base64
 import re
 import shutil
 import threading
+import io
 import urllib.request
 import urllib.error
 from datetime import datetime
@@ -1975,6 +1976,11 @@ runtime_settings = {
     # Background helpers (summaries, lorebook, memory librarian, image
     # descriptions) stay local. Off by default.
     "use_cloud_credits": False,
+    # The existing cloud session that cloud turns are sent to (its ID, e.g.
+    # session_..., or its claude.ai/code URL). The CLI can only message an
+    # existing cloud session non-interactively, so the user creates one at
+    # claude.ai/code and pastes it here.
+    "cloud_session_id": "",
 }
 
 # ============================================================================
@@ -1994,7 +2000,7 @@ PERSISTED_SETTING_KEYS = {
     "creativity", "bridge_port",
     "cli_session_reuse", "update_check_enabled",
     "character_memory_v2_enabled", "pinned_char_key",
-    "use_cloud_credits",
+    "use_cloud_credits", "cloud_session_id",
 }
 
 
@@ -2609,25 +2615,117 @@ _load_sessions()
 # =============================================================================
 # CLAUDE CLOUD CREDITS MODE
 # =============================================================================
-# With use_cloud_credits on, the main RP turn runs as `claude -p --cloud`:
-# the CLI starts a Claude Code cloud session, runs the turn there, and prints
-# the result. Differences from the local path:
-#   - `--resume` can't be combined with `-p --cloud`, so session reuse is
-#     skipped and every turn sends the full prompt.
-#   - The cloud container uses its own configuration, so local-only flags
-#     (--system-prompt-file, --tools) aren't applied there. The system prompt
-#     is put at the top of the message instead.
-#   - Output is `--output-format json` (stream-json isn't available for
-#     `-p --cloud`), parsed by _iter_cli_events into the same event shapes.
+# With use_cloud_credits on, the main RP turn is sent as a message to an
+# existing Claude Code cloud session: `claude -p --cloud <session-id>`. (The
+# CLI only starts NEW cloud sessions interactively, so the user creates one at
+# claude.ai/code and pastes its ID or URL into the GUI.) Differences from the
+# local path:
+#   - The cloud session keeps its own history, like a --resume'd local
+#     session. When _decide_resume says the request is a natural follow-up
+#     (tracked under a separate "cloud::<char_key>" entry), only the newest
+#     user message is sent. Otherwise (first turn, swipe, edit, reuse off)
+#     the full prompt is sent with a note that it replaces everything earlier
+#     in the session.
+#   - An existing session keeps the model and settings it was created with,
+#     so --model / --effort / --system-prompt-file don't apply. The system
+#     prompt is put at the top of full-context messages instead.
+#   - Output is `--output-format json` (stream-json isn't available here),
+#     parsed by _iter_cli_events into the same event shapes.
+#   - A session still finishing an earlier turn (e.g. after a swipe or Stop,
+#     which doesn't stop the cloud turn) refuses new messages; the bridge
+#     waits and retries for a while.
 #   - The CLI is started from an empty folder so none of the bridge's files
-#     (chats, memory DBs, settings) are synced into the cloud session.
+#     (chats, memory DBs, settings) can be synced into the cloud session.
 
 CLOUD_WORKDIR = os.path.join(tempfile.gettempdir(), "claude_bridge_cloud")
-CLOUD_SESSION_NAME = "SillyTavern bridge"
+CLOUD_SESSION_KEY_PREFIX = "cloud::"
+CLOUD_BUSY_RETRY_SECONDS = 15
+CLOUD_BUSY_MAX_WAIT_SECONDS = 300
 
 CLOUD_TURN_PREAMBLE = """=== CLOUD SESSION NOTE ===
 This cloud session is the narrative backend for SillyTavern, a roleplay front end. It is not a coding task: do not use any tools, do not read, create or modify files, do not run commands, and do not commit or push anything. Reply with only the response described below, exactly as it should appear in the chat.
 === END CLOUD SESSION NOTE ==="""
+
+CLOUD_FULL_CONTEXT_NOTE = """=== FULL CONTEXT ===
+This message carries the complete, current state of the roleplay and replaces everything earlier in this session. Ignore previous messages and replies here (they may belong to a swiped or edited branch) and work only from what follows.
+=== END FULL CONTEXT ==="""
+
+CLOUD_CONTINUE_NOTE = "[SillyTavern roleplay continues. The user's next message is below. Reply only with your in-character response, following the same instructions and formatting as before.]"
+
+
+class _FinishedProcess:
+    """Stand-in for a Popen whose output has already been collected."""
+
+    def __init__(self, stdout: str, stderr: str, returncode: int):
+        self.stdout = io.StringIO(stdout or "")
+        self.stderr = io.StringIO(stderr or "")
+        self.returncode = returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        pass
+
+
+def _run_cloud_cli(cmd: list, prompt: str, process_holder: dict = None) -> "_FinishedProcess":
+    """Run a cloud turn to completion and return its collected output.
+
+    The prompt goes in on stdin (no command-line length limit). Retries while
+    the session is busy with an earlier turn, and once with the prompt as an
+    argument if this CLI doesn't take it from stdin.
+    """
+    deadline = time.time() + CLOUD_BUSY_MAX_WAIT_SECONDS
+    positional = False
+    while True:
+        run_cmd = list(cmd) + ([prompt] if positional else [])
+        proc = subprocess.Popen(
+            run_cmd,
+            stdin=subprocess.DEVNULL if positional else subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            cwd=_cloud_workdir(),
+        )
+        if process_holder is not None:
+            process_holder["process"] = proc
+
+        # Drain stderr and feed stdin on threads so neither pipe can fill up
+        # and stall the CLI while we block on stdout.
+        err_chunks = []
+        err_thread = threading.Thread(target=lambda p=proc: err_chunks.append(p.stderr.read()), daemon=True)
+        err_thread.start()
+        if not positional:
+            def _feed(p=proc):
+                try:
+                    p.stdin.write(prompt)
+                    p.stdin.close()
+                except OSError:
+                    pass  # CLI exited early; its stderr says why
+            threading.Thread(target=_feed, daemon=True).start()
+
+        out = proc.stdout.read()
+        proc.wait()
+        err_thread.join(timeout=10)
+        err = "".join(err_chunks)
+        said = f"{err}\n{out}"
+
+        if process_holder is not None and process_holder.get("cancelled"):
+            break
+        if proc.returncode != 0:
+            if "is busy with a turn" in said and time.time() + CLOUD_BUSY_RETRY_SECONDS < deadline:
+                log(f"Cloud session is still busy with an earlier turn — retrying in {CLOUD_BUSY_RETRY_SECONDS}s", "WARN")
+                time.sleep(CLOUD_BUSY_RETRY_SECONDS)
+                if process_holder is not None and process_holder.get("cancelled"):
+                    break
+                continue
+            if not positional and re.search(r"needs a (prompt|task)|requires a prompt", said, re.I) and len(prompt) < 7000:
+                log("Cloud CLI didn't take the prompt on stdin — retrying with it as an argument", "WARN")
+                positional = True
+                continue
+        break
+    return _FinishedProcess(out, err, proc.returncode)
 
 
 def _cloud_workdir() -> str:
@@ -2699,6 +2797,18 @@ def call_claude_code(messages: list, tools: list = None, process_holder: dict = 
     Returns dict with 'response', optionally 'thinking', and optionally 'tool_calls'.
     """
     use_cloud = bool(runtime_settings.get("use_cloud_credits", False))
+    cloud_session_id = (runtime_settings.get("cloud_session_id") or "").strip()
+    if use_cloud and not cloud_session_id:
+        log("Cloud mode is on but no cloud session ID is set (Settings tab)", "ERROR")
+        return {
+            "response": (
+                "**Bridge error — no cloud session set.** Claude Cloud Credits is on, but the bridge "
+                "doesn't know which cloud session to use. Create a session at claude.ai/code, copy its "
+                "URL (or its session ID), paste it into *Cloud session* in the bridge's Settings tab and "
+                "save. Or turn Claude Cloud Credits off."
+            ),
+            "thinking": None,
+        }
 
     # Separate system prompt from conversation
     system_prompt = None
@@ -3051,21 +3161,41 @@ Use the Read tool to view each, then weave the visual details into your scene wi
         if match:
             scene_images_block = match.group(0)
 
+    # Local and cloud turns each keep their own session, and neither sees the
+    # other's turns. Drop the other mode's session for this character so a
+    # later switch back starts from the full history instead of continuing a
+    # session that missed turns.
+    try:
+        mode_key = char_key or get_character_key(track)
+    except Exception:
+        mode_key = None
+    if mode_key == "default":
+        mode_key = None
+    cloud_key = f"{CLOUD_SESSION_KEY_PREFIX}{mode_key}" if mode_key else None
+    other_key = mode_key if use_cloud else cloud_key
+    if other_key:
+        with _SESSION_LOCK:
+            if SESSION_MAP.pop(other_key, None) is not None:
+                _save_sessions()
+                log(f"Cleared the {'local' if use_cloud else 'cloud'} session for [{mode_key}] (switched modes)", "INFO")
+
+    cloud_delta = False
     if use_cloud:
-        if runtime_settings.get("debug_output"):
-            log("Cloud mode: CLI session reuse skipped (--resume isn't available for cloud turns)", "INFO")
-        # The local CLI session won't see this turn, so drop it: otherwise a
-        # later local turn would --resume it and send only the newest message,
-        # missing everything that happened in cloud mode.
-        try:
-            stale_key = char_key or get_character_key(track)
-        except Exception:
-            stale_key = None
-        if stale_key:
-            with _SESSION_LOCK:
-                if SESSION_MAP.pop(stale_key, None) is not None:
-                    _save_sessions()
-                    log(f"Cloud mode: cleared local CLI session for [{stale_key}]", "INFO")
+        if cloud_key and runtime_settings.get("cli_session_reuse", True):
+            _, prev_cloud, cloud_reason = _decide_resume(track, char_key_override=cloud_key)
+            if prev_cloud and prev_cloud != cloud_session_id:
+                cloud_reason = "cloud session changed in settings"
+                prev_cloud = None
+            latest_user = _extract_latest_user_text(messages) if prev_cloud else ""
+            if prev_cloud and latest_user.strip():
+                cloud_delta = True
+                parts = [CLOUD_CONTINUE_NOTE]
+                if scene_images_block:
+                    parts.append(scene_images_block)
+                parts.append(latest_user)
+                prompt = "\n\n".join(parts)
+            if runtime_settings.get("debug_output"):
+                log(f"Cloud session: {'sending newest message only' if cloud_delta else 'sending full context'} ({cloud_reason})", "INFO")
     elif runtime_settings.get("cli_session_reuse", True):
         resume_char_key, resume_session_id, resume_reason = _decide_resume(track, char_key_override=char_key)
         if resume_session_id:
@@ -3088,13 +3218,15 @@ Use the Read tool to view each, then weave the visual details into your scene wi
                 log(f"Not resuming [{resume_char_key}]: {resume_reason}", "INFO")
 
     if use_cloud:
-        # Local-only flags aren't applied in the cloud container, so the
-        # system prompt rides at the top of the message instead of in a file.
-        # --model / --effort are passed for the CLI to apply if it can.
-        cloud_head = CLOUD_TURN_PREAMBLE
-        if core_identity:
-            cloud_head += f"\n\n=== CORE INSTRUCTIONS ===\n\n{core_identity}\n\n=== END CORE INSTRUCTIONS ==="
-        prompt = f"{cloud_head}\n\n{prompt}"
+        # An existing cloud session keeps its own configuration, so the
+        # system prompt rides at the top of full-context messages instead of
+        # in a file. Newest-message-only turns rely on the session having
+        # seen it already.
+        if not cloud_delta:
+            cloud_head = f"{CLOUD_TURN_PREAMBLE}\n\n{CLOUD_FULL_CONTEXT_NOTE}"
+            if core_identity:
+                cloud_head += f"\n\n=== CORE INSTRUCTIONS ===\n\n{core_identity}\n\n=== END CORE INSTRUCTIONS ==="
+            prompt = f"{cloud_head}\n\n{prompt}"
         core_identity = None
         if json_schema is not None:
             log("Cloud mode: response_format / json_schema isn't supported for cloud turns — ignored", "WARN")
@@ -3103,10 +3235,7 @@ Use the Read tool to view each, then weave the visual details into your scene wi
             CLAUDE_EXE,
             "-p",
             "--output-format", "json",
-            "--effort", effort,
-            "--model", runtime_settings["model"],
-            "-n", CLOUD_SESSION_NAME,
-            "--cloud",
+            "--cloud", cloud_session_id,
         ]
     else:
         cmd = [
@@ -3165,7 +3294,8 @@ Use the Read tool to view each, then weave the visual details into your scene wi
             log(f"  → {img_path}", "INFO")
 
     if use_cloud:
-        log(f"Calling Claude in a CLOUD session ({runtime_settings['model']}, effort={effort}) — this can take a few minutes...", "INFO")
+        log(f"Sending to cloud session {cloud_session_id[-24:]} ({'newest message' if cloud_delta else 'full context'}, "
+            f"{len(prompt):,} chars) — this can take a while...", "INFO")
     else:
         log(f"Calling Claude ({runtime_settings['model']}, effort={effort})...", "INFO")
     start_time = time.time()
@@ -3175,63 +3305,46 @@ Use the Read tool to view each, then weave the visual details into your scene wi
         # stdout reads on the Python side — without this, the default 8KB
         # block buffer hoards small JSON event lines until the subprocess
         # exits, which defeats real-time streaming downstream.
-        process = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            bufsize=1,
-            cwd=_cloud_workdir() if use_cloud else None,
-        )
-
-        # Expose the subprocess handle to the caller so they can cancel us
-        # (e.g. on client disconnect in the SSE generator).
-        if process_holder is not None:
-            process_holder["process"] = process
-
-        # Cloud turns run for minutes and the CLI may write progress notices
-        # to stderr meanwhile; drain it on a thread so a full pipe can't stall
-        # the process while we're blocked reading stdout.
-        cloud_stderr_chunks = []
-        cloud_stderr_thread = None
         if use_cloud:
-            cloud_stderr_thread = threading.Thread(
-                target=lambda: cloud_stderr_chunks.append(process.stderr.read()),
-                daemon=True,
+            # Runs the turn to completion (waiting out a busy session) and
+            # returns a finished-process stand-in for the parsing below.
+            process = _run_cloud_cli(cmd, prompt, process_holder)
+        else:
+            process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                bufsize=1,
             )
-            cloud_stderr_thread.start()
 
-        # Send prompt and close stdin. If the CLI exits before reading it
-        # (bad flag, not logged in, cloud mode unavailable...), the write
-        # fails with a broken pipe (EINVAL on Windows); report what the CLI
-        # itself said instead of the bare pipe error.
-        try:
-            process.stdin.write(prompt)
-            process.stdin.close()
-        except OSError as pipe_err:
+            # Expose the subprocess handle to the caller so they can cancel us
+            # (e.g. on client disconnect in the SSE generator).
+            if process_holder is not None:
+                process_holder["process"] = process
+
+            # Send prompt and close stdin. If the CLI exits before reading it
+            # (bad flag, not logged in...), the write fails with a broken
+            # pipe (EINVAL on Windows); report what the CLI itself said
+            # instead of the bare pipe error.
             try:
-                process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                process.kill()
-            if cloud_stderr_thread is not None:
-                cloud_stderr_thread.join(timeout=10)
-                cli_err = "".join(cloud_stderr_chunks)
-            else:
+                process.stdin.write(prompt)
+                process.stdin.close()
+            except OSError as pipe_err:
+                try:
+                    process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    process.kill()
                 cli_err = process.stderr.read()
-            try:
-                cli_out = process.stdout.read()
-            except Exception:
-                cli_out = ""
-            detail = (cli_err or "").strip() or (cli_out or "").strip() or f"no output ({pipe_err})"
-            log(f"Claude CLI exited before reading the prompt (exit {process.returncode}): {detail}", "ERROR")
-            if use_cloud:
-                log("Cloud mode: run `echo hi | claude -p --cloud` in a terminal to see whether cloud "
-                    "mode works for this CLI/account; update with `claude update`, or turn Claude "
-                    "Cloud Credits off in the GUI.", "ERROR")
-            where = " (cloud session)" if use_cloud else ""
-            return {"response": f"Error from Claude Code{where}: {detail}", "thinking": None}
+                try:
+                    cli_out = process.stdout.read()
+                except Exception:
+                    cli_out = ""
+                detail = (cli_err or "").strip() or (cli_out or "").strip() or f"no output ({pipe_err})"
+                log(f"Claude CLI exited before reading the prompt (exit {process.returncode}): {detail}", "ERROR")
+                return {"response": f"Error from Claude Code: {detail}", "thinking": None}
 
         # Read output line by line as it streams
         response_text = ""
@@ -3363,11 +3476,7 @@ Use the Read tool to view each, then weave the visual details into your scene wi
 
         # Wait for process to complete
         process.wait(timeout=300)
-        if cloud_stderr_thread is not None:
-            cloud_stderr_thread.join(timeout=10)
-            stderr = "".join(cloud_stderr_chunks)
-        else:
-            stderr = process.stderr.read()
+        stderr = process.stderr.read()
 
         elapsed = time.time() - start_time
 
@@ -3388,8 +3497,11 @@ Use the Read tool to view each, then weave the visual details into your scene wi
             error_msg = stderr.strip() if stderr.strip() else "Unknown error (no stderr)"
             log(f"Claude Code error (exit {process.returncode}): {error_msg}", "ERROR")
             if use_cloud:
-                log("Cloud mode: check that `echo hi | claude -p --cloud` works in a terminal, "
-                    "update the CLI (`claude update`), or turn Claude Cloud Credits off in the GUI.", "ERROR")
+                if not stderr.strip() and response_text.strip():
+                    error_msg = response_text.strip()  # the CLI said it on stdout
+                log("Cloud mode: check the cloud session in the Settings tab (open it at claude.ai/code "
+                    "to make sure it exists and isn't archived), update the CLI with `claude update`, "
+                    "or turn Claude Cloud Credits off.", "ERROR")
                 return {"response": f"Error from Claude Code (cloud session): {error_msg}", "thinking": None}
             return {"response": f"Error from Claude Code: {error_msg}", "thinking": None}
 
@@ -3485,7 +3597,15 @@ Use the Read tool to view each, then weave the visual details into your scene wi
         # return path above. If the client disconnected mid-stream and we
         # killed the subprocess, call_claude_code returns before reaching
         # here, so no stale session_id gets persisted.
-        # Cloud session ids can't be resumed locally, so they're never stored.
+        # Record the cloud turn so the next one can send only the newest
+        # message (see _decide_resume). A cloud result's session_id isn't a
+        # local session, so it never goes through the local path below.
+        if use_cloud and cloud_key and clean_response and clean_response.strip():
+            try:
+                _update_session(cloud_key, cloud_session_id, track)
+            except Exception as e:
+                log(f"Could not record cloud session state: {e}", "WARN")
+
         if captured_session_id and not use_cloud:
             try:
                 # Prefer the caller-supplied char_key (computed from the
@@ -4319,7 +4439,7 @@ def update_settings():
         log(f"CHUNKING: {old_val} -> {new_val}")
 
     memory_v2_was_enabled = runtime_settings.get("character_memory_v2_enabled", False)
-    for key in ["effort_level", "include_thinking", "show_thinking_console", "debug_output", "model", "tool_calling_enabled", "auto_summary_enabled", "auto_summary_threshold", "auto_summary_max_length", "lorebook_enabled", "lorebook_path", "lorebook_name", "system_prompt_override", "thinking_prompt", "no_thinking_prompt", "creativity", "bridge_port", "cli_session_reuse", "update_check_enabled", "character_memory_v2_enabled", "pinned_char_key", "use_cloud_credits"]:
+    for key in ["effort_level", "include_thinking", "show_thinking_console", "debug_output", "model", "tool_calling_enabled", "auto_summary_enabled", "auto_summary_threshold", "auto_summary_max_length", "lorebook_enabled", "lorebook_path", "lorebook_name", "system_prompt_override", "thinking_prompt", "no_thinking_prompt", "creativity", "bridge_port", "cli_session_reuse", "update_check_enabled", "character_memory_v2_enabled", "pinned_char_key", "use_cloud_credits", "cloud_session_id"]:
         if key in data:
             # Coerce bridge_port to int and bounds-check. Invalid values are rejected.
             if key == "bridge_port":
@@ -4330,6 +4450,8 @@ def update_settings():
                 if not (1 <= port <= 65535):
                     return jsonify({"error": "bridge_port must be between 1 and 65535"}), 400
                 runtime_settings[key] = port
+            elif key == "cloud_session_id":
+                runtime_settings[key] = str(data[key] or "").strip()
             else:
                 runtime_settings[key] = data[key]
 
