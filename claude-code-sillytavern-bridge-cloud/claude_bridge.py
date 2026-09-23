@@ -3203,9 +3203,35 @@ Use the Read tool to view each, then weave the visual details into your scene wi
             )
             cloud_stderr_thread.start()
 
-        # Send prompt and close stdin
-        process.stdin.write(prompt)
-        process.stdin.close()
+        # Send prompt and close stdin. If the CLI exits before reading it
+        # (bad flag, not logged in, cloud mode unavailable...), the write
+        # fails with a broken pipe (EINVAL on Windows); report what the CLI
+        # itself said instead of the bare pipe error.
+        try:
+            process.stdin.write(prompt)
+            process.stdin.close()
+        except OSError as pipe_err:
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            if cloud_stderr_thread is not None:
+                cloud_stderr_thread.join(timeout=10)
+                cli_err = "".join(cloud_stderr_chunks)
+            else:
+                cli_err = process.stderr.read()
+            try:
+                cli_out = process.stdout.read()
+            except Exception:
+                cli_out = ""
+            detail = (cli_err or "").strip() or (cli_out or "").strip() or f"no output ({pipe_err})"
+            log(f"Claude CLI exited before reading the prompt (exit {process.returncode}): {detail}", "ERROR")
+            if use_cloud:
+                log("Cloud mode: run `echo hi | claude -p --cloud` in a terminal to see whether cloud "
+                    "mode works for this CLI/account; update with `claude update`, or turn Claude "
+                    "Cloud Credits off in the GUI.", "ERROR")
+            where = " (cloud session)" if use_cloud else ""
+            return {"response": f"Error from Claude Code{where}: {detail}", "thinking": None}
 
         # Read output line by line as it streams
         response_text = ""
