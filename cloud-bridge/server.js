@@ -348,7 +348,12 @@ const server = http.createServer(async (req, res) => {
       return res.end();
     }
     if (req.method === 'GET' && (url === '' || url === '/health')) {
-      return sendJson(res, 200, { ok: true, running, queued: waiting.length });
+      return sendJson(res, 200, {
+        ok: true,
+        message: `Bridge is running. In SillyTavern use Chat Completion > Custom (OpenAI-compatible) with endpoint http://${req.headers.host}/v1`,
+        running,
+        queued: waiting.length,
+      });
     }
     if (!authorized(req)) return sendError(res, 401, 'invalid API key');
     if (req.method === 'GET' && (url === '/v1/models' || url === '/models')) {
