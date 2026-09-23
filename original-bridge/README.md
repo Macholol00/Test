@@ -123,6 +123,29 @@ Edit any of these, save, and the next request picks up the change. No server res
 
 **The main RP system prompt** is *not* in the `prompts/` folder — it's the `DEFAULT_BRIDGE_SYSTEM_PROMPT` constant in `claude_bridge.py`. Edit it via the System Prompt tab in the GUI, which persists to `bridge_settings.json`.
 
+## Claude cloud credits (optional)
+
+The **Claude Cloud Credits** switch at the top of the Settings tab sends each roleplay reply to a **Claude Code cloud session** (`claude -p --cloud`) instead of your local `claude -p`. That reply then uses your Claude Code cloud-session credits rather than your local Claude Code usage. Turn it off and the bridge works exactly as before. The choice is saved in `bridge_settings.json`.
+
+Before turning it on, check that cloud mode works from a terminal on the same machine:
+
+```bash
+echo "Say hi in five words." | claude -p --cloud
+```
+
+If that prints a reply, the switch will work. If it errors, update the CLI (`claude update`) and make sure you can start a cloud session at claude.ai/code.
+
+What changes while it's on:
+
+- **Slower replies.** Every reply starts a cloud container, so expect roughly 30 seconds to a few minutes.
+- **No CLI session reuse.** `--resume` isn't available for cloud turns, so each turn sends the full prompt. Turn on Auto-Summary to keep that prompt small. The local session for the character is cleared, so when you switch back to local the next turn starts fresh with the full history.
+- **The system prompt goes into the message.** The cloud container runs with its own configuration and ignores `--system-prompt-file`, so the bridge puts your system prompt at the top of the message instead. Model and effort are still passed along.
+- **Only the main reply runs in the cloud.** Auto-summary, the lorebook, the Character Memory librarian and image descriptions still run on your local CLI.
+- **Images the local pre-pass can't describe are skipped.** The cloud session can't open files on your PC. Images that the local description pass handles still work.
+- **`response_format` / JSON schema requests are ignored.**
+- **One session per reply.** Each reply shows up in your claude.ai/code session list as "SillyTavern bridge"; archive them there whenever you like.
+- **Your files stay local.** The CLI is started from an empty temporary folder (`claude_bridge_cloud` in your temp directory), so your chats, memory databases and settings aren't synced into the cloud session.
+
 ## Known limitations
 
 These are **architectural**, not bugs — they're properties of running Claude Code CLI as a subprocess per request, and there's no clean fix inside the current CLI version.
