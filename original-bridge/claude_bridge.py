@@ -1916,8 +1916,10 @@ runtime_settings = {
     "debug_output": DEBUG_RAW_OUTPUT,
     # Simple chunking toggle (one-shot)
     "chunking_enabled": False,
-    # Model selection: "opus" (latest), "claude-opus-4-8", "claude-opus-4-6", or "sonnet"
-    # Note: 4.7 was deprecated and is no longer available
+    # Model selection: anything the Claude CLI's --model accepts — a family
+    # alias for the latest model ("opus", "sonnet", "haiku", "fable") or a
+    # full model ID ("claude-opus-4-6", "claude-sonnet-5", ...). The GUI
+    # offers buttons for the common ones plus a custom model ID box.
     "model": "opus",
     # Tool calling support for extensions like TunnelVision
     "tool_calling_enabled": True,
@@ -2933,7 +2935,8 @@ Use the Read tool to view each, then weave the visual details into your scene wi
     # users can leave effort at max globally without silently breaking
     # every Sonnet request.
     effort = runtime_settings["effort_level"]
-    if runtime_settings["model"] == "sonnet" and effort in ("high", "xhigh", "max"):
+    model_name = str(runtime_settings["model"]).lower()
+    if "sonnet" in model_name and effort in ("high", "xhigh", "max"):
         log(f"Clamping effort {effort} → medium (Sonnet produces no narrative above medium)", "WARN")
         effort = "medium"
 
@@ -2999,6 +3002,9 @@ Use the Read tool to view each, then weave the visual details into your scene wi
         "--model", runtime_settings["model"],
         "--tools", tools_arg,
     ]
+    # Haiku has no effort levels; don't send one.
+    if "haiku" in model_name:
+        del cmd[cmd.index("--effort"):cmd.index("--effort") + 2]
 
     # Structured-output passthrough. Clients that send OpenAI's
     # `response_format` get Claude Code's `--json-schema` validation so the
@@ -4165,6 +4171,14 @@ def update_settings():
                 if not (1 <= port <= 65535):
                     return jsonify({"error": "bridge_port must be between 1 and 65535"}), 400
                 runtime_settings[key] = port
+            elif key == "model":
+                # Any model ID the CLI accepts. Restricted to plain ID
+                # characters: on Windows the CLI is a .cmd run through
+                # cmd.exe, where characters like & or | would be interpreted.
+                model = str(data[key] or "").strip()
+                if not re.fullmatch(r"[A-Za-z0-9._:/@\[\]-]{1,100}", model):
+                    return jsonify({"error": "model must be a model ID like claude-opus-4-6 (letters, numbers, . _ - : / @ [ ])"}), 400
+                runtime_settings[key] = model
             else:
                 runtime_settings[key] = data[key]
 

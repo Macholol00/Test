@@ -352,6 +352,20 @@
             background: var(--ink-sunk);
         }
 
+        /* Many version buttons: wrap three to a row instead of squeezing. */
+        .model-versions .toggle-btn {
+            flex: 1 0 30%;
+            padding: 11px 4px;
+            letter-spacing: 0.04em;
+            white-space: nowrap;
+        }
+
+        #customModelBtn {
+            flex: 0 0 auto;
+            border: 1px solid var(--rule);
+            padding: 9px 16px;
+        }
+
         .toggle-btn {
             flex: 1 1 0;
             min-width: 0;
@@ -896,12 +910,33 @@
             <div class="settings-grid">
                 <div class="setting-card">
                     <h3>Model</h3>
-                    <p style="color:var(--paper-faint);font-size:12px;margin-bottom:10px;">Opus = latest (4.7), most capable · Opus 4.6 = prior Opus, faster output · Sonnet = fastest</p>
+                    <p style="color:var(--paper-faint);font-size:12px;margin-bottom:10px;">Latest = always the newest model of that family · or pin a specific version · or type any model ID the Claude CLI accepts. What's available depends on your plan.</p>
+                    <div style="color:var(--paper-faint);font-size:11px;margin-bottom:4px;">Latest</div>
                     <div class="toggle-group">
                         <button class="toggle-btn active" data-setting="model" data-value="opus">Opus</button>
-                        <button class="toggle-btn" data-setting="model" data-value="claude-opus-4-6">Opus 4.6</button>
                         <button class="toggle-btn" data-setting="model" data-value="sonnet">Sonnet</button>
+                        <button class="toggle-btn" data-setting="model" data-value="haiku">Haiku</button>
+                        <button class="toggle-btn" data-setting="model" data-value="fable">Fable</button>
                     </div>
+                    <div style="color:var(--paper-faint);font-size:11px;margin:10px 0 4px;">Specific version</div>
+                    <div class="toggle-group model-versions">
+                        <button class="toggle-btn" data-setting="model" data-value="claude-fable-5-1">Fable 5.1</button>
+                        <button class="toggle-btn" data-setting="model" data-value="claude-fable-5">Fable 5</button>
+                        <button class="toggle-btn" data-setting="model" data-value="claude-opus-5-5">Opus 5.5</button>
+                        <button class="toggle-btn" data-setting="model" data-value="claude-opus-5">Opus 5</button>
+                        <button class="toggle-btn" data-setting="model" data-value="claude-opus-4-8">Opus 4.8</button>
+                        <button class="toggle-btn" data-setting="model" data-value="claude-opus-4-7">Opus 4.7</button>
+                        <button class="toggle-btn" data-setting="model" data-value="claude-opus-4-6">Opus 4.6</button>
+                        <button class="toggle-btn" data-setting="model" data-value="claude-sonnet-5">Sonnet 5</button>
+                        <button class="toggle-btn" data-setting="model" data-value="claude-sonnet-4-6">Sonnet 4.6</button>
+                        <button class="toggle-btn" data-setting="model" data-value="claude-haiku-4-5">Haiku 4.5</button>
+                    </div>
+                    <div style="color:var(--paper-faint);font-size:11px;margin:10px 0 4px;">Custom model ID</div>
+                    <div style="display:flex;gap:8px;align-items:center;">
+                        <input type="text" id="customModel" placeholder="e.g. claude-sonnet-4-5" spellcheck="false" autocomplete="off" style="flex:1;min-width:0;padding:8px 10px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;">
+                        <button class="toggle-btn" id="customModelBtn" data-setting="model" data-value="">Use</button>
+                    </div>
+                    <p id="modelHaikuNote" style="display:none;color:var(--paper-faint);font-size:11px;margin-top:8px;line-height:1.4;">Haiku has no effort levels; the Effort setting is ignored for it.</p>
                 </div>
 
                 <div class="setting-card">
@@ -2608,8 +2643,10 @@ Common subject fields: subject, character, npc, entity, name.' style="width:100%
 
         function updateEffortAvailability() {
             const activeModel = document.querySelector('[data-setting="model"].active');
-            const model = activeModel ? activeModel.dataset.value : 'opus';
-            const isSonnet = (model === 'sonnet');
+            const model = (activeModel ? activeModel.dataset.value : 'opus').toLowerCase();
+            const isSonnet = model.includes('sonnet');
+            const haikuNote = document.getElementById('modelHaikuNote');
+            if (haikuNote) haikuNote.style.display = model.includes('haiku') ? 'block' : 'none';
 
             // Toggle disabled state on the high/xhigh/max buttons.
             document.querySelectorAll('[data-setting="effort"]').forEach(btn => {
@@ -2643,6 +2680,15 @@ Common subject fields: subject, character, npc, entity, name.' style="width:100%
                 // clicks and keyboard activation too.
                 if (btn.classList.contains('disabled')) return;
                 const setting = btn.dataset.setting;
+                // The custom-model button carries whatever is typed in the box.
+                if (btn.id === 'customModelBtn') {
+                    const typed = document.getElementById('customModel').value.trim();
+                    if (!/^[A-Za-z0-9._:\/@\[\]-]+$/.test(typed)) {
+                        alert('Type a model ID first (letters, numbers, dots, dashes), e.g. claude-sonnet-4-5');
+                        return;
+                    }
+                    btn.dataset.value = typed;
+                }
                 document.querySelectorAll(`[data-setting="${setting}"]`).forEach(b => b.classList.remove('active'));
                 btn.classList.add('active');
                 // When the model changes, re-evaluate which effort levels
@@ -2651,6 +2697,14 @@ Common subject fields: subject, character, npc, entity, name.' style="width:100%
                 if (setting === 'model') updateEffortAvailability();
                 saveSettings(); // Auto-save when toggled
             });
+        });
+
+        // Enter in the custom model box = click "Use".
+        document.getElementById('customModel').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                document.getElementById('customModelBtn').click();
+            }
         });
 
         // Switch toggles (auto-save on change)
@@ -2827,7 +2881,14 @@ Common subject fields: subject, character, npc, entity, name.' style="width:100%
                 const settings = await response.json();
 
                 // Apply settings to UI
-                document.querySelectorAll('[data-setting="model"]').forEach(btn => {
+                // A model that isn't one of the buttons is a custom model ID.
+                const modelBtns = [...document.querySelectorAll('[data-setting="model"]:not(#customModelBtn)')];
+                const isCustomModel = !!settings.model && !modelBtns.some(b => b.dataset.value === settings.model);
+                const customBtn = document.getElementById('customModelBtn');
+                customBtn.dataset.value = isCustomModel ? settings.model : '';
+                document.getElementById('customModel').value = isCustomModel ? settings.model : '';
+                customBtn.classList.toggle('active', isCustomModel);
+                modelBtns.forEach(btn => {
                     btn.classList.toggle('active', btn.dataset.value === settings.model);
                 });
                 document.querySelectorAll('[data-setting="effort"]').forEach(btn => {
